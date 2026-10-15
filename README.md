@@ -11,8 +11,8 @@ Status: prototype, **not deployed**. Its single-token, bid-only predecessor is l
 
 Each token has one canonical pool: {token, USDC} sorted, static LP fee 0, tickSpacing 1, this hook. `beforeSwap`
 (with `beforeSwapReturnsDelta`) fills the whole swap at the hook's price, so the AMM amount is always 0. The pool's
-`sqrtPriceX96` is never used, liquidity added to the pool is never traded, and no v4 protocol fee can apply. Routers pass
-empty `hookData`; nothing is signed off-chain.
+`sqrtPriceX96` is never used and liquidity added to the pool is never traded. Routers pass empty `hookData`; nothing is
+signed off-chain.
 
 | Side | Swapper | Price per token |
 |---|---|---|
@@ -20,9 +20,36 @@ empty `hookData`; nothing is signed off-chain.
 | Ask | buys the token | NAV x (1 + `askApyBps` x min(now - `updatedAt`, `MAX_ACCRUAL`) / 365 days) x (1 + `askPremiumBps`) |
 
 NAV is the feed's latest answer and `updatedAt` its timestamp, so the ask's linear accrual restarts from zero at every
-new round and only the fixed premium remains. Rounding always favours the maker. Two immutable bounds hold whatever the
-parameters: the bid never pays more than NAV x `MAX_BID_BPS`, and the ask never sells below NAV x
-(1 + `MIN_ASK_PREMIUM_BPS`).
+new round and only the fixed premium remains. Rounding always favours the maker.
+
+Immutable bands, fixed in the constructor (`Bounds`), hold whatever the maker posts:
+
+| Protects | Bound |
+|---|---|
+| Maker | the bid never pays more than NAV x `MAX_BID_BPS`; the ask never sells below NAV x (1 + `MIN_ASK_PREMIUM_BPS`) |
+| Swapper | `bidDiscountBps` <= `MAX_BID_DISCOUNT_BPS`; `askPremiumBps` <= `MAX_ASK_PREMIUM_BPS`; `askApyBps` <= `MAX_ASK_APY_BPS`; `MAX_ACCRUAL` <= 60 days |
+
+So, before the protocol fee, the bid never pays less than NAV x (1 - `MAX_BID_DISCOUNT_BPS`) and the ask never charges
+more than NAV x (1 + `MAX_ASK_APY_BPS` x `MAX_ACCRUAL` / year) x (1 + `MAX_ASK_PREMIUM_BPS`). The maker cannot move a
+price outside these bands against a swap already in flight.
+
+## Protocol fee
+
+Custom accounting does not bypass the v4 protocol fee. On every fill the hook reads the pool's protocol fee for the
+swap direction from the PoolManager (`getSlot0`), where Uniswap governance sets it through the `protocolFeeController`
+(V4FeeAdapter), and pays it to that controller's `TOKEN_JAR`, following the convention of Uniswap's own aggregator
+hooks (`v4-hooks-public`, `aggregator-hooks/ProtocolFees.sol`).
+
+- The swapper pays the fee; the maker's price is unchanged.
+- The fee is `f` pips of the gross USDC flow, rounded up, always in USDC: exact-in `ceil(gross x f / 1e6)`, exact-out
+  `ceil(net x f / (1e6 - f))`. In bid exact-in and ask exact-out USDC is the unspecified side, as in Uniswap's hooks;
+  in the other two modes the swapper's token only reaches the PoolManager after the swap, so the same share is taken
+  in USDC.
+- The raw pool fee is used (multiplier 1), the same rate the AMM would charge. The hook does not self-classify through
+  `protocolFeeFlags()`.
+- If the controller has no resolvable `TOKEN_JAR`, nothing is charged. The lookup is gas-capped and accepts only a
+  clean address word, so a replaced controller cannot block swaps.
+- Under the governance configuration at the time of writing, these pools resolve to a protocol fee of 0.
 
 ## Maker parameters
 
@@ -48,13 +75,14 @@ Kill switch: `validUntil = 0`, or both remainings 0. It skips every feed call, s
   USDC claims, plus any USDC sent to the hook directly, are deposited into the vault for `MAKER`. If the vault refuses
   the deposit, the approval is reset and the USDC is transferred to `MAKER` instead.
 
-Events: `ParamsSet`, `Filled`, `HookSwap` (OpenZeppelin uniswap-hooks `IHookEvents`), `Swept(currency, amount,
-deposited)`.
+Events: `ParamsSet`, `Filled` (swapper amounts and the protocol fee), `ProtocolFeesCollected(recipient, currency,
+amount)`, `HookSwap` (OpenZeppelin uniswap-hooks `IHookEvents`), `Swept(currency, amount, deposited)`.
 
 ## Safety properties
 
 - No owner, not upgradeable. Every address and the token list are fixed in the constructor.
-- Assets only ever move to `MAKER`, into the vault for `MAKER`, or out to a swapper at the hook's price.
+- Assets only ever move to `MAKER`, into the vault for `MAKER`, out to a swapper at the hook's price, or to the
+  protocol's TokenJar as the protocol fee.
 - Exposure is bounded by the per-side remainings and by the maker's two approvals: vault shares (bid funding beyond USDC
   claims) and each token (ask delivery beyond token claims).
 - The only state between transactions is ERC-6909 claims owed to `MAKER`.
@@ -69,19 +97,23 @@ deposited)`.
 - A permissionless sweep can move ask inventory (token claims) to `MAKER`, after which asks need the maker's token
   allowance (liveness only, no loss).
 - A caller that syncs and pays its input before calling `swap` reverts with `CurrencyNotSettled`; no value is lost.
-  UniversalRouter's V4Router is unaffected.
+  With a non-zero protocol fee this also covers asks filled from claims, because the fee is taken from the
+  PoolManager's USDC before the buyer settles. UniversalRouter's V4Router is unaffected.
 
 ## Tests
 
 Mainnet-fork tests (Foundry) at a pinned block, swapping through the mainnet UniversalRouter with empty `hookData`.
-`test/MidasQuoteHook.fork.t.sol` (45 tests) covers:
+`test/MidasQuoteHook.fork.t.sol` (57 tests) covers:
 
 - bid and ask, exact-in and exact-out, for tokens sorted as currency0 and as currency1;
 - force-deallocation, USDC-claim-funded bids, token-claim and allowance-funded asks;
 - ask accrual, linear and then capped;
 - round, validity, floor, ceiling and kill-switch guards;
 - sweep and sweepAll, including the deposit fallback and stray USDC;
-- liquidity in the pool never traded, the maximum protocol fee taking nothing, and V4Quoter parity.
+- the protocol fee set through the real governance path (fee setter override plus `triggerFeeUpdate`), different per
+  direction, in all four modes for both currency orders, plus quoter parity, the no-TokenJar paths and dust output;
+- swapper and maker bands in `setParams` and the constructor;
+- liquidity in the pool never traded, and V4Quoter parity.
 
 ```sh
 git clone --recurse-submodules https://github.com/dnr00/midas-quote-hook

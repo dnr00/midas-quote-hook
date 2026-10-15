@@ -7,6 +7,8 @@ import {IUnlockCallback} from "v4-core/interfaces/callback/IUnlockCallback.sol";
 import {Hooks} from "v4-core/libraries/Hooks.sol";
 import {FullMath} from "v4-core/libraries/FullMath.sol";
 import {SafeCast} from "v4-core/libraries/SafeCast.sol";
+import {StateLibrary} from "v4-core/libraries/StateLibrary.sol";
+import {ProtocolFeeLibrary} from "v4-core/libraries/ProtocolFeeLibrary.sol";
 import {PoolKey} from "v4-core/types/PoolKey.sol";
 import {PoolId, PoolIdLibrary} from "v4-core/types/PoolId.sol";
 import {Currency} from "v4-core/types/Currency.sol";
@@ -21,6 +23,11 @@ import {
 
 interface IVaultV2Deposit {
     function deposit(uint256 assets, address onBehalf) external returns (uint256 shares);
+}
+
+/// @dev Uniswap's V4FeeAdapter, the PoolManager's protocolFeeController on Ethereum, names the protocol fee recipient.
+interface IProtocolFeeAdapter {
+    function TOKEN_JAR() external view returns (address);
 }
 
 interface IERC20Ops {
@@ -39,7 +46,12 @@ interface IERC20Ops {
 /// token's feed; the maker only sets parameters, each bound to the feed's current round and a validity timestamp.
 /// @dev Routers always pass empty hookData. Ownerless, not upgradeable; every address and the token list are fixed at
 /// construction. beforeSwap always consumes the whole specified amount, so the AMM is never asked to swap anything and
-/// any liquidity added to the pool is never traded. The swapper's input is not yet in the PoolManager when beforeSwap
+/// any liquidity added to the pool is never traded. Custom accounting does not bypass the v4 protocol fee: every fill
+/// charges the swapper the pool's protocol fee for the swap direction, as Uniswap governance sets it in the
+/// PoolManager, in ASSET, and pays it to the protocol fee controller's TokenJar (Uniswap's aggregator-hook
+/// convention). Swappers are protected by immutable bands on every maker parameter: before the protocol fee, the bid
+/// never pays less than NAV x (1 - MAX_BID_DISCOUNT_BPS / 10,000) and the ask never charges more than
+/// NAV x (1 + MAX_ASK_APY_BPS x MAX_ACCRUAL / (10,000 x YEAR)) x (1 + MAX_ASK_PREMIUM_BPS / 10,000). The swapper's input is not yet in the PoolManager when beforeSwap
 /// runs (routers settle after the swap), so the hook takes it as an ERC6909 claim; claims are the only thing the hook
 /// holds, they are owed to MAKER, and anyone can sweep them: token claims to MAKER, USDC claims (plus any USDC sent to the
 /// hook directly) deposited into VAULT for MAKER, or sent to MAKER if VAULT refuses the deposit. Requires two maker approvals: VAULT shares to this contract (bounds bid funding beyond the hook's USDC claims)
@@ -47,6 +59,8 @@ interface IERC20Ops {
 contract MidasQuoteHook is IUnlockCallback {
     using PoolIdLibrary for PoolKey;
     using SafeCast for uint256;
+    using StateLibrary for IPoolManager;
+    using ProtocolFeeLibrary for uint24;
 
     error NotPoolManager();
     error NotMaker();
@@ -66,6 +80,9 @@ contract MidasQuoteHook is IUnlockCallback {
     error ApproveFailed();
     error AssetTransferFailed();
     error BadConfig();
+    error DiscountAboveMax();
+    error PremiumAboveMax();
+    error ApyAboveMax();
 
     enum Side {
         Bid,
@@ -89,6 +106,23 @@ contract MidasQuoteHook is IUnlockCallback {
         uint128 askRemaining;
     }
 
+    /// @notice Immutable price bands. The maker-side bounds cap what the maker can lose to a mispriced parameter; the
+    /// swapper-side bounds cap how far the maker can move a price against a swap already in flight.
+    /// @param maxBidBps Maker side: the bid never exceeds NAV x maxBidBps / 10,000.
+    /// @param maxBidDiscountBps Swapper side: the bid never falls below NAV x (1 - maxBidDiscountBps / 10,000).
+    /// @param minAskPremiumBps Maker side: the ask never falls below NAV x (1 + minAskPremiumBps / 10,000).
+    /// @param maxAskPremiumBps Swapper side: askPremiumBps never exceeds it.
+    /// @param maxAskApyBps Swapper side: askApyBps never exceeds it.
+    /// @param maxAccrual The most seconds of APY accrual the ask ever adds; at most 60 days.
+    struct Bounds {
+        uint256 maxBidBps;
+        uint256 maxBidDiscountBps;
+        uint256 minAskPremiumBps;
+        uint256 maxAskPremiumBps;
+        uint256 maxAskApyBps;
+        uint256 maxAccrual;
+    }
+
     /// @param token The mToken this pool trades against ASSET.
     /// @param tokenIsCurrency0 The token sorts below ASSET.
     /// @param scaleExp tokenDecimals + feedDecimals - assetDecimals.
@@ -101,9 +135,21 @@ contract MidasQuoteHook is IUnlockCallback {
     }
 
     event ParamsSet(address indexed token, Params params);
+    /// @param amountIn What the swapper paid.
+    /// @param amountOut What the swapper received.
+    /// @param protocolFee The ASSET paid to the TokenJar out of the swap: the maker paid amountOut + protocolFee on a
+    /// bid and received amountIn - protocolFee on an ask.
     event Filled(
-        address indexed token, Side side, address sender, uint256 amountIn, uint256 amountOut, uint256 deallocated
+        address indexed token,
+        Side side,
+        address sender,
+        uint256 amountIn,
+        uint256 amountOut,
+        uint256 protocolFee,
+        uint256 deallocated
     );
+    /// @dev Same shape as Uniswap's aggregator hooks' ProtocolFees event.
+    event ProtocolFeesCollected(address indexed recipient, Currency indexed currency, uint256 amount);
     /// @param deposited ASSET only: true when deposited into VAULT for MAKER, false when VAULT refused the deposit and
     /// the ASSET went to MAKER directly. Always false for a token, which always goes to MAKER as the token.
     event Swept(address indexed currency, uint256 amount, bool deposited);
@@ -120,6 +166,12 @@ contract MidasQuoteHook is IUnlockCallback {
 
     uint256 private constant BPS = 10_000;
     uint256 private constant YEAR = 365 days;
+    uint256 private constant PIPS = 1_000_000;
+    /// @dev Upper bound on maxAccrual, so the ask's swapper-side ceiling is bounded by the constructor alone.
+    uint256 private constant MAX_ACCRUAL_LIMIT = 60 days;
+    /// @dev Gas for the controller's TOKEN_JAR() lookup. The deployed V4FeeAdapter answers from an immutable for well
+    /// under 1,000 gas; the cap keeps a replaced controller from consuming the swap's gas.
+    uint256 private constant TOKEN_JAR_GAS = 50_000;
     int24 public constant TICK_SPACING = 1;
     uint256 public constant MAX_TOKENS = 3;
     /// @dev Keeps 10 ** scaleExp and the products below it far from overflow.
@@ -133,8 +185,14 @@ contract MidasQuoteHook is IUnlockCallback {
     address public immutable MAKER;
     /// @notice The bid never exceeds NAV x MAX_BID_BPS / 10,000.
     uint256 public immutable MAX_BID_BPS;
+    /// @notice The bid never falls below NAV x (1 - MAX_BID_DISCOUNT_BPS / 10,000).
+    uint256 public immutable MAX_BID_DISCOUNT_BPS;
     /// @notice The ask never falls below NAV x (1 + MIN_ASK_PREMIUM_BPS / 10,000).
     uint256 public immutable MIN_ASK_PREMIUM_BPS;
+    /// @notice askPremiumBps never exceeds MAX_ASK_PREMIUM_BPS.
+    uint256 public immutable MAX_ASK_PREMIUM_BPS;
+    /// @notice askApyBps never exceeds MAX_ASK_APY_BPS.
+    uint256 public immutable MAX_ASK_APY_BPS;
     /// @notice The most seconds of APY accrual the ask ever adds.
     uint256 public immutable MAX_ACCRUAL;
     /// @dev ERC6909 id of ASSET in the PoolManager.
@@ -154,14 +212,18 @@ contract MidasQuoteHook is IUnlockCallback {
         address maker,
         address[] memory tokens_,
         address[] memory feeds,
-        uint256 maxBidBps,
-        uint256 minAskPremiumBps,
-        uint256 maxAccrual
+        Bounds memory b
     ) {
         if (
             poolManager == address(0) || vault == address(0) || marketAdapter == address(0) || maker == address(0)
-                || maxBidBps == 0 || maxBidBps > BPS || minAskPremiumBps > BPS || tokens_.length == 0
-                || tokens_.length > MAX_TOKENS || tokens_.length != feeds.length
+                || tokens_.length == 0 || tokens_.length > MAX_TOKENS || tokens_.length != feeds.length
+        ) revert BadConfig();
+        // Each band must be non-empty: some discount d satisfies BPS - maxBidBps <= d <= maxBidDiscountBps < BPS, and
+        // some premium satisfies minAskPremiumBps <= premium <= maxAskPremiumBps.
+        if (
+            b.maxBidBps == 0 || b.maxBidBps > BPS || b.maxBidDiscountBps >= BPS
+                || BPS - b.maxBidBps > b.maxBidDiscountBps || b.maxAskPremiumBps > BPS
+                || b.minAskPremiumBps > b.maxAskPremiumBps || b.maxAskApyBps > BPS || b.maxAccrual > MAX_ACCRUAL_LIMIT
         ) revert BadConfig();
         if (IMorphoMarketV1AdapterV2(marketAdapter).parentVault() != vault) revert BadConfig();
         if (!IVaultV2(vault).isAdapter(marketAdapter)) revert BadConfig();
@@ -173,9 +235,12 @@ contract MidasQuoteHook is IUnlockCallback {
         address asset = IVaultV2(vault).asset();
         ASSET = asset;
         MAKER = maker;
-        MAX_BID_BPS = maxBidBps;
-        MIN_ASK_PREMIUM_BPS = minAskPremiumBps;
-        MAX_ACCRUAL = maxAccrual;
+        MAX_BID_BPS = b.maxBidBps;
+        MAX_BID_DISCOUNT_BPS = b.maxBidDiscountBps;
+        MIN_ASK_PREMIUM_BPS = b.minAskPremiumBps;
+        MAX_ASK_PREMIUM_BPS = b.maxAskPremiumBps;
+        MAX_ASK_APY_BPS = b.maxAskApyBps;
+        MAX_ACCRUAL = b.maxAccrual;
         ASSET_ID = uint256(uint160(asset));
 
         uint256 assetDecimals = IERC20(asset).decimals();
@@ -242,8 +307,9 @@ contract MidasQuoteHook is IUnlockCallback {
     /// @notice Replaces `token`'s parameters. `validUntil = 0`, or both remainings zero, is the kill switch and skips
     /// every check, so the maker can always stop a token, even while its feed is broken. Otherwise `p.round` must be
     /// the feed's current round (a future round's NAV cannot be pre-approved), the feed must answer above zero and each
-    /// open side must respect its bound: bidDiscountBps < 10,000 and 10,000 - bidDiscountBps <= MAX_BID_BPS;
-    /// askPremiumBps >= MIN_ASK_PREMIUM_BPS. A side with zero remaining is closed and not checked.
+    /// open side must sit inside its bands: 10,000 - MAX_BID_BPS <= bidDiscountBps <= MAX_BID_DISCOUNT_BPS;
+    /// MIN_ASK_PREMIUM_BPS <= askPremiumBps <= MAX_ASK_PREMIUM_BPS and askApyBps <= MAX_ASK_APY_BPS. A side with zero
+    /// remaining is closed and not checked.
     function setParams(address token, Params calldata p) external {
         if (msg.sender != MAKER) revert NotMaker();
         PoolId id = poolIdOf[token];
@@ -255,8 +321,13 @@ contract MidasQuoteHook is IUnlockCallback {
             if (p.bidRemaining != 0) {
                 if (p.bidDiscountBps >= BPS) revert ZeroPrice();
                 if (BPS - p.bidDiscountBps > MAX_BID_BPS) revert PriceAboveCeiling();
+                if (p.bidDiscountBps > MAX_BID_DISCOUNT_BPS) revert DiscountAboveMax();
             }
-            if (p.askRemaining != 0 && p.askPremiumBps < MIN_ASK_PREMIUM_BPS) revert PriceBelowFloor();
+            if (p.askRemaining != 0) {
+                if (p.askPremiumBps < MIN_ASK_PREMIUM_BPS) revert PriceBelowFloor();
+                if (p.askPremiumBps > MAX_ASK_PREMIUM_BPS) revert PremiumAboveMax();
+                if (p.askApyBps > MAX_ASK_APY_BPS) revert ApyAboveMax();
+            }
         }
         params[token] = p;
         emit ParamsSet(token, p);
@@ -354,46 +425,98 @@ contract MidasQuoteHook is IUnlockCallback {
         PoolId id = key.toId();
         Market memory m = markets[id];
         if (m.token == address(0)) revert WrongPool();
+        ProtocolFee memory pf = _protocolFee(id, sp.zeroForOne);
+        (uint256 amountIn, uint256 amountOut) = _fill(sender, m, sp, pf);
+        return (IHooks.beforeSwap.selector, _delta(id, sender, sp, amountIn, amountOut), 0);
+    }
 
-        bool exactInput = sp.amountSpecified < 0;
-        (uint256 amountIn, uint256 amountOut) = _fill(
-            sender,
-            m,
-            sp.zeroForOne == m.tokenIsCurrency0 ? Side.Bid : Side.Ask,
-            exactInput,
-            exactInput ? uint256(-sp.amountSpecified) : uint256(sp.amountSpecified)
-        );
-
-        // Specified is the input for exact-in and the output for exact-out. A positive hook delta is owed to the hook,
-        // a negative one is owed by it; the swapper's side is the negation.
+    /// @dev amountIn and amountOut are the swapper's. Specified is the input for exact-in and the output for
+    /// exact-out. A positive hook delta is owed to the hook, a negative one is owed by it; the swapper's side is the
+    /// negation.
+    function _delta(PoolId id, address sender, IPoolManager.SwapParams calldata sp, uint256 amountIn, uint256 amountOut)
+        private
+        returns (BeforeSwapDelta)
+    {
         int128 inDelta = amountIn.toInt128();
         int128 outDelta = amountOut.toInt128();
         if (sp.zeroForOne) emit HookSwap(PoolId.unwrap(id), sender, inDelta, -outDelta, 0, 0);
         else emit HookSwap(PoolId.unwrap(id), sender, -outDelta, inDelta, 0, 0);
-        BeforeSwapDelta delta =
-            exactInput ? toBeforeSwapDelta(inDelta, -outDelta) : toBeforeSwapDelta(-outDelta, inDelta);
-        return (IHooks.beforeSwap.selector, delta, 0);
+        return sp.amountSpecified < 0 ? toBeforeSwapDelta(inDelta, -outDelta) : toBeforeSwapDelta(-outDelta, inDelta);
     }
 
-    /// @dev Prices and spends the fill, clears the hook's PoolManager deltas for it and emits Filled.
-    function _fill(address sender, Market memory m, Side side, bool exactInput, uint256 specified)
+    /// @dev Prices and spends the fill, clears the hook's PoolManager deltas for it, pays the protocol fee and emits
+    /// Filled. Swapper sells the token: bid. Swapper buys the token: ask. Returns the swapper's amounts.
+    function _fill(address sender, Market memory m, IPoolManager.SwapParams calldata sp, ProtocolFee memory pf)
         private
         returns (uint256 amountIn, uint256 amountOut)
     {
-        (amountIn, amountOut) = _consume(m, side, exactInput, specified);
+        Side side = sp.zeroForOne == m.tokenIsCurrency0 ? Side.Bid : Side.Ask;
+        bool exactInput = sp.amountSpecified < 0;
+        uint256 specified = exactInput ? uint256(-sp.amountSpecified) : uint256(sp.amountSpecified);
+        // tokenAmount and assetAmount are the maker's legs at the maker's price; the protocol fee sits between the
+        // maker's ASSET leg and the swapper's.
+        (uint256 tokenAmount, uint256 assetAmount, uint256 fee) = _consume(m, side, exactInput, specified, pf.pips);
         uint256 deallocated;
-        if (side == Side.Bid) deallocated = _settleBid(m.token, amountIn, amountOut);
-        else _settleAsk(m.token, amountIn, amountOut);
-        emit Filled(m.token, side, sender, amountIn, amountOut, deallocated);
+        if (side == Side.Bid) {
+            deallocated = _settleBid(m.token, tokenAmount, assetAmount);
+            (amountIn, amountOut) = (tokenAmount, assetAmount - fee);
+        } else {
+            _settleAsk(m.token, assetAmount, tokenAmount);
+            (amountIn, amountOut) = (assetAmount + fee, tokenAmount);
+        }
+        if (fee != 0) {
+            POOL_MANAGER.take(Currency.wrap(ASSET), pf.recipient, fee);
+            emit ProtocolFeesCollected(pf.recipient, Currency.wrap(ASSET), fee);
+        }
+        emit Filled(m.token, side, sender, amountIn, amountOut, fee, deallocated);
+    }
+
+    // ------------------------------------------------------------------ protocol fee
+
+    /// @param pips The pool's protocol fee for the swap direction, in hundredths of a bip (at most 1,000).
+    /// @param recipient The TokenJar it is paid to.
+    struct ProtocolFee {
+        uint256 pips;
+        address recipient;
+    }
+
+    /// @dev Reads the pool's protocol fee for the swap direction from the PoolManager, where Uniswap governance sets it
+    /// through the protocolFeeController, and resolves the TokenJar from that controller. With no fee, or no
+    /// resolvable TokenJar, nothing is charged (Uniswap's aggregator hooks do the same). The lookup is gas-capped and
+    /// reads one word, and any failure, short answer, or word that is not an address means no TokenJar, so a replaced
+    /// controller can never block swaps.
+    function _protocolFee(PoolId id, bool zeroForOne) private view returns (ProtocolFee memory pf) {
+        (,, uint24 raw,) = POOL_MANAGER.getSlot0(id);
+        uint256 pips = zeroForOne ? raw.getZeroForOneFee() : raw.getOneForZeroFee();
+        if (pips == 0) return pf;
+        address controller = POOL_MANAGER.protocolFeeController();
+        if (controller.code.length == 0) return pf;
+        bytes4 selector = IProtocolFeeAdapter.TOKEN_JAR.selector;
+        bool ok;
+        uint256 word;
+        assembly ("memory-safe") {
+            let ptr := mload(0x40)
+            mstore(ptr, selector)
+            ok := staticcall(TOKEN_JAR_GAS, controller, ptr, 0x04, ptr, 0x20)
+            ok := and(ok, iszero(lt(returndatasize(), 0x20)))
+            word := mload(ptr)
+        }
+        if (!ok || word == 0 || word >> 160 != 0) return pf;
+        pf = ProtocolFee({pips: pips, recipient: address(uint160(word))});
     }
 
     // ------------------------------------------------------------------ pricing
 
-    /// @dev Checks the parameters against the feed, prices the fill and spends it from the side's remaining.
-    /// Bid: in = token, out = ASSET, remaining counts token in. Ask: in = ASSET, out = token, remaining counts token out.
-    function _consume(Market memory m, Side side, bool exactInput, uint256 specified)
+    /// @dev Checks the parameters against the feed, prices the fill and spends it from the side's remaining. Returns
+    /// the maker's legs and the protocol fee, all at the maker's price; remaining counts tokenAmount on both sides.
+    /// The fee is `feePips` of the gross ASSET flow, rounded up:
+    /// - Bid exact-in (token in): swapper receives assetAmount - fee, fee = ceil(assetAmount x f / 1e6).
+    /// - Bid exact-out (ASSET out): assetAmount = out + fee, fee = ceil(out x f / (1e6 - f)).
+    /// - Ask exact-in (ASSET in): assetAmount = in - fee, fee = ceil(in x f / 1e6).
+    /// - Ask exact-out (token out): swapper pays assetAmount + fee, fee = ceil(assetAmount x f / (1e6 - f)).
+    function _consume(Market memory m, Side side, bool exactInput, uint256 specified, uint256 feePips)
         private
-        returns (uint256 amountIn, uint256 amountOut)
+        returns (uint256 tokenAmount, uint256 assetAmount, uint256 fee)
     {
         Params storage ps = params[m.token];
         Params memory p = ps;
@@ -407,69 +530,84 @@ contract MidasQuoteHook is IUnlockCallback {
         uint256 scale = 10 ** m.scaleExp;
 
         if (side == Side.Bid) {
-            (amountIn, amountOut) = _bidAmounts(uint256(answer), scale, p.bidDiscountBps, exactInput, specified);
-            if (amountIn > remaining) revert AmountExceedsRemaining();
-            ps.bidRemaining = uint128(remaining - amountIn);
+            if (exactInput) {
+                tokenAmount = specified;
+                assetAmount = _bidAsset(uint256(answer), scale, p.bidDiscountBps, tokenAmount);
+                fee = FullMath.mulDivRoundingUp(assetAmount, feePips, PIPS);
+                if (assetAmount <= fee) revert ZeroAmount();
+            } else {
+                fee = FullMath.mulDivRoundingUp(specified, feePips, PIPS - feePips);
+                assetAmount = specified + fee;
+                if (specified == 0) revert ZeroAmount();
+                tokenAmount = _bidToken(uint256(answer), scale, p.bidDiscountBps, assetAmount);
+            }
+            _checkBidCeiling(uint256(answer), scale, tokenAmount, assetAmount);
+            if (tokenAmount > remaining) revert AmountExceedsRemaining();
+            ps.bidRemaining = uint128(remaining - tokenAmount);
         } else {
-            (amountIn, amountOut) = _askAmounts(uint256(answer), scale, updatedAt, p, exactInput, specified);
-            if (amountOut > remaining) revert AmountExceedsRemaining();
-            ps.askRemaining = uint128(remaining - amountOut);
+            (uint256 num, uint256 den) = _askPrice(uint256(answer), scale, updatedAt, p);
+            if (exactInput) {
+                fee = FullMath.mulDivRoundingUp(specified, feePips, PIPS);
+                assetAmount = specified - fee;
+                tokenAmount = FullMath.mulDiv(assetAmount, den, num);
+            } else {
+                tokenAmount = specified;
+                assetAmount = FullMath.mulDivRoundingUp(tokenAmount, num, den);
+                fee = FullMath.mulDivRoundingUp(assetAmount, feePips, PIPS - feePips);
+            }
+            if (tokenAmount == 0) revert ZeroAmount();
+            _checkAskFloor(uint256(answer), scale, tokenAmount, assetAmount);
+            if (tokenAmount > remaining) revert AmountExceedsRemaining();
+            ps.askRemaining = uint128(remaining - tokenAmount);
         }
     }
 
     /// @dev NAV = feed answer, `scale` = 10 ** (tokenDecimals + feedDecimals - assetDecimals). The bid in ASSET base
-    /// units per token base unit is NAV x (10,000 - bidDiscountBps) / (scale x 10,000).
-    /// Exact-in (token in): out = floor(in x NAV x (10,000 - d) / (scale x 10,000)).
-    /// Exact-out (ASSET out): in = ceil(out x scale x 10,000 / (NAV x (10,000 - d))).
-    /// Both round in the maker's favour. The fill is then checked against the ceiling on the realised amounts:
-    /// out x scale x 10,000 <= in x NAV x MAX_BID_BPS.
-    function _bidAmounts(uint256 nav, uint256 scale, uint256 discountBps, bool exactInput, uint256 specified)
+    /// units per token base unit is NAV x (10,000 - bidDiscountBps) / (scale x 10,000). ASSET for `tokenAmount`,
+    /// rounded down (in the maker's favour).
+    function _bidAsset(uint256 nav, uint256 scale, uint256 discountBps, uint256 tokenAmount)
         private
-        view
-        returns (uint256 amountIn, uint256 amountOut)
+        pure
+        returns (uint256 assetAmount)
     {
-        uint256 num = nav * (BPS - discountBps);
-        uint256 den = scale * BPS;
-        if (exactInput) {
-            amountIn = specified;
-            amountOut = FullMath.mulDiv(amountIn, num, den);
-        } else {
-            amountOut = specified;
-            amountIn = FullMath.mulDivRoundingUp(amountOut, den, num);
-        }
-        if (amountOut == 0) revert ZeroAmount();
-        if (amountOut * den > amountIn * nav * MAX_BID_BPS) revert PriceAboveCeiling();
+        assetAmount = FullMath.mulDiv(tokenAmount, nav * (BPS - discountBps), scale * BPS);
+        if (assetAmount == 0) revert ZeroAmount();
+    }
+
+    /// @dev Tokens for `assetAmount` at the bid, rounded up (in the maker's favour).
+    function _bidToken(uint256 nav, uint256 scale, uint256 discountBps, uint256 assetAmount)
+        private
+        pure
+        returns (uint256)
+    {
+        return FullMath.mulDivRoundingUp(assetAmount, scale * BPS, nav * (BPS - discountBps));
+    }
+
+    /// @dev The ceiling on the realised maker legs: assetAmount x scale x 10,000 <= tokenAmount x NAV x MAX_BID_BPS.
+    function _checkBidCeiling(uint256 nav, uint256 scale, uint256 tokenAmount, uint256 assetAmount) private view {
+        if (assetAmount * scale * BPS > tokenAmount * nav * MAX_BID_BPS) revert PriceAboveCeiling();
     }
 
     /// @dev t = min(block.timestamp - updatedAt, MAX_ACCRUAL). The ask in ASSET base units per token base unit is
-    /// NAV x (10,000 x YEAR + askApyBps x t) x (10,000 + askPremiumBps) / (scale x 10,000 x YEAR x 10,000), with
-    /// YEAR = 365 days: NAV x (1 + apy x t / YEAR) x (1 + premium).
-    /// Exact-in (ASSET in): out = floor(in x den / num). Exact-out (token out): in = ceil(out x num / den).
-    /// Both round in the maker's favour. The fill is then checked against the floor on the realised amounts:
-    /// in x scale x 10,000 >= out x NAV x (10,000 + MIN_ASK_PREMIUM_BPS).
-    function _askAmounts(
-        uint256 nav,
-        uint256 scale,
-        uint256 updatedAt,
-        Params memory p,
-        bool exactInput,
-        uint256 specified
-    ) private view returns (uint256 amountIn, uint256 amountOut) {
+    /// num / den = NAV x (10,000 x YEAR + askApyBps x t) x (10,000 + askPremiumBps) / (scale x 10,000 x YEAR x 10,000),
+    /// with YEAR = 365 days: NAV x (1 + apy x t / YEAR) x (1 + premium). Callers round tokens out down and ASSET in up.
+    function _askPrice(uint256 nav, uint256 scale, uint256 updatedAt, Params memory p)
+        private
+        view
+        returns (uint256 num, uint256 den)
+    {
         // A feed stamped in the future is broken; refuse rather than guess its age.
         if (updatedAt > block.timestamp) revert BadOracleAnswer();
         uint256 t = block.timestamp - updatedAt;
         if (t > MAX_ACCRUAL) t = MAX_ACCRUAL;
-        uint256 num = nav * (BPS * YEAR + uint256(p.askApyBps) * t) * (BPS + p.askPremiumBps);
-        uint256 den = scale * BPS * YEAR * BPS;
-        if (exactInput) {
-            amountIn = specified;
-            amountOut = FullMath.mulDiv(amountIn, den, num);
-        } else {
-            amountOut = specified;
-            amountIn = FullMath.mulDivRoundingUp(amountOut, num, den);
-        }
-        if (amountOut == 0) revert ZeroAmount();
-        if (amountIn * scale * BPS < amountOut * nav * (BPS + MIN_ASK_PREMIUM_BPS)) revert PriceBelowFloor();
+        num = nav * (BPS * YEAR + uint256(p.askApyBps) * t) * (BPS + p.askPremiumBps);
+        den = scale * BPS * YEAR * BPS;
+    }
+
+    /// @dev The floor on the realised maker legs: assetAmount x scale x 10,000 >= tokenAmount x NAV x
+    /// (10,000 + MIN_ASK_PREMIUM_BPS).
+    function _checkAskFloor(uint256 nav, uint256 scale, uint256 tokenAmount, uint256 assetAmount) private view {
+        if (assetAmount * scale * BPS < tokenAmount * nav * (BPS + MIN_ASK_PREMIUM_BPS)) revert PriceBelowFloor();
     }
 
     // ------------------------------------------------------------------ settlement
@@ -501,7 +639,10 @@ contract MidasQuoteHook is IUnlockCallback {
 
     /// @dev Clears the hook's PoolManager deltas for an ask: +amountIn ASSET as a claim (the buyer pays after the swap),
     /// -amountOut token paid first by burning the hook's token claims, then by moving the rest from MAKER into the
-    /// PoolManager under the maker's allowance. Same sync/settle caveat as `_settleBid`.
+    /// PoolManager under the maker's allowance. Same sync/settle caveat as `_settleBid`; in addition, a non-zero
+    /// protocol fee is `take`n from the PoolManager's ASSET balance in `_fill`, so a caller that syncs and transfers
+    /// ASSET before calling swap and settles afterwards reverts with CurrencyNotSettled even when this function does
+    /// not sync.
     function _settleAsk(address token, uint256 amountIn, uint256 amountOut) private {
         POOL_MANAGER.mint(address(this), ASSET_ID, amountIn);
 

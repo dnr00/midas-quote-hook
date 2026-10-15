@@ -31,6 +31,22 @@ interface IMidasFeed {
     function setRoundDataSafe(int256 data) external;
 }
 
+/// @dev Uniswap's V4FeeAdapter, the PoolManager's protocolFeeController at the fork block.
+interface IV4FeeAdapterLike {
+    function feeSetter() external view returns (address);
+    function TOKEN_JAR() external view returns (address);
+    function getFee(PoolKey memory key) external view returns (uint24);
+    function setPoolOverride(PoolId poolId, uint24 feeValue) external;
+    function triggerFeeUpdate(PoolKey calldata key) external;
+}
+
+/// @dev A protocolFeeController whose TOKEN_JAR() never returns.
+contract GasBurningController {
+    function TOKEN_JAR() external pure returns (address) {
+        for (;;) {}
+    }
+}
+
 interface IERC20Meta {
     function decimals() external view returns (uint8);
     function allowance(address owner, address spender) external view returns (uint256);
@@ -61,6 +77,7 @@ abstract contract MidasHookForkBase is Test {
     address constant PERMIT2 = 0x000000000022D473030F116dDEE9F6B43aC78BA3;
     address constant V4_QUOTER = 0x52F0E24D1c21C8A0cB1e5a5dD6198556BD9E1203;
     address constant PROTOCOL_FEE_CONTROLLER = 0x89A5D5bF00a27D55c02951E49078a5C5771051dB;
+    address constant TOKEN_JAR = 0xf38521f130fcCF29dB1961597bc5d2B60F995f85;
     address constant VAULT_CURATOR = 0x75178137D3B4B9A0F771E0e149b00fB8167BA325;
     address constant SHARE_HOLDER = 0x933aDeDd85824dA75ec8a334a7907e69e7c02833;
     address constant USDC = Mainnet.USDC;
@@ -83,7 +100,10 @@ abstract contract MidasHookForkBase is Test {
     int256 constant MARB_NAV = 100_000_000;
 
     uint256 constant MAX_BID_BPS = 9_990;
+    uint256 constant MAX_BID_DISCOUNT_BPS = 300;
     uint256 constant MIN_ASK_PREMIUM_BPS = 10;
+    uint256 constant MAX_ASK_PREMIUM_BPS = 300;
+    uint256 constant MAX_ASK_APY_BPS = 2_000;
     uint256 constant MAX_ACCRUAL = 35 days;
     uint16 constant BID_DISCOUNT = 50;
     uint16 constant ASK_PREMIUM = 30;
@@ -106,6 +126,8 @@ abstract contract MidasHookForkBase is Test {
     address maker;
     address trader = makeAddr("trader");
     uint40 validUntil;
+    /// @dev Gas for the router call in `_swap`; 0 forwards all.
+    uint256 swapGas;
 
     function setUp() public virtual {
         vm.createSelectFork("mainnet", BLOCK);
@@ -117,17 +139,7 @@ abstract contract MidasHookForkBase is Test {
         assertEq(hookAddr.code.length, 0, "hook address is empty on mainnet");
         deployCodeTo(
             "MidasQuoteHook.sol:MidasQuoteHook",
-            abi.encode(
-                POOL_MANAGER,
-                VAULT,
-                MARKET_ADAPTER,
-                maker,
-                _tokenList(),
-                _feedList(),
-                MAX_BID_BPS,
-                MIN_ASK_PREMIUM_BPS,
-                MAX_ACCRUAL
-            ),
+            abi.encode(POOL_MANAGER, VAULT, MARKET_ADAPTER, maker, _tokenList(), _feedList(), _bounds()),
             hookAddr
         );
         hook = MidasQuoteHook(hookAddr);
@@ -175,6 +187,17 @@ abstract contract MidasHookForkBase is Test {
         f[0] = MHYPER_FEED;
         f[1] = MALPHA_FEED;
         f[2] = MARB_FEED;
+    }
+
+    function _bounds() internal pure returns (MidasQuoteHook.Bounds memory) {
+        return MidasQuoteHook.Bounds({
+            maxBidBps: MAX_BID_BPS,
+            maxBidDiscountBps: MAX_BID_DISCOUNT_BPS,
+            minAskPremiumBps: MIN_ASK_PREMIUM_BPS,
+            maxAskPremiumBps: MAX_ASK_PREMIUM_BPS,
+            maxAskApyBps: MAX_ASK_APY_BPS,
+            maxAccrual: MAX_ACCRUAL
+        });
     }
 
     function _round(address token) internal view returns (uint80) {
@@ -267,7 +290,13 @@ abstract contract MidasHookForkBase is Test {
         inputs[0] = abi.encode(actions, params);
         vm.prank(trader);
         uint256 g = gasleft();
-        IUniversalRouter(UNIVERSAL_ROUTER).execute(abi.encodePacked(uint8(0x10)), inputs, block.timestamp);
+        if (swapGas == 0) {
+            IUniversalRouter(UNIVERSAL_ROUTER).execute(abi.encodePacked(uint8(0x10)), inputs, block.timestamp);
+        } else {
+            IUniversalRouter(UNIVERSAL_ROUTER).execute{gas: swapGas}(
+                abi.encodePacked(uint8(0x10)), inputs, block.timestamp
+            );
+        }
         gasUsed = g - gasleft();
     }
 
@@ -325,8 +354,8 @@ abstract contract MidasHookForkBase is Test {
     function _filledDeallocated(Vm.Log[] memory logs) internal view returns (uint256) {
         for (uint256 i; i < logs.length; ++i) {
             if (logs[i].emitter == address(hook) && logs[i].topics[0] == MidasQuoteHook.Filled.selector) {
-                (,,,, uint256 deallocated) =
-                    abi.decode(logs[i].data, (MidasQuoteHook.Side, address, uint256, uint256, uint256));
+                (,,,,, uint256 deallocated) =
+                    abi.decode(logs[i].data, (MidasQuoteHook.Side, address, uint256, uint256, uint256, uint256));
                 return deallocated;
             }
         }
@@ -413,7 +442,10 @@ contract MidasQuoteHookForkTest is MidasHookForkBase, IUnlockCallback {
         assertEq(hook.ASSET(), USDC);
         assertEq(hook.MAKER(), maker);
         assertEq(hook.MAX_BID_BPS(), MAX_BID_BPS);
+        assertEq(hook.MAX_BID_DISCOUNT_BPS(), MAX_BID_DISCOUNT_BPS);
         assertEq(hook.MIN_ASK_PREMIUM_BPS(), MIN_ASK_PREMIUM_BPS);
+        assertEq(hook.MAX_ASK_PREMIUM_BPS(), MAX_ASK_PREMIUM_BPS);
+        assertEq(hook.MAX_ASK_APY_BPS(), MAX_ASK_APY_BPS);
         assertEq(hook.MAX_ACCRUAL(), MAX_ACCRUAL);
         address[] memory toks = hook.tokens();
         assertEq(toks.length, 3);
@@ -437,17 +469,7 @@ contract MidasQuoteHookForkTest is MidasHookForkBase, IUnlockCallback {
         address predicted = vm.computeCreateAddress(address(this), vm.getNonce(address(this)));
         assertTrue(uint160(predicted) & Hooks.ALL_HOOK_MASK != HOOK_FLAGS);
         vm.expectRevert(abi.encodeWithSelector(Hooks.HookAddressNotValid.selector, predicted));
-        new MidasQuoteHook(
-            POOL_MANAGER,
-            VAULT,
-            MARKET_ADAPTER,
-            maker,
-            _tokenList(),
-            _feedList(),
-            MAX_BID_BPS,
-            MIN_ASK_PREMIUM_BPS,
-            MAX_ACCRUAL
-        );
+        new MidasQuoteHook(POOL_MANAGER, VAULT, MARKET_ADAPTER, maker, _tokenList(), _feedList(), _bounds());
     }
 
     function test_constructor_badTokenLists_revert() public {
@@ -456,40 +478,49 @@ contract MidasQuoteHookForkTest is MidasHookForkBase, IUnlockCallback {
 
         t[1] = USDC; // the vault asset
         vm.expectRevert(MidasQuoteHook.BadConfig.selector);
-        new MidasQuoteHook(POOL_MANAGER, VAULT, MARKET_ADAPTER, maker, t, f, MAX_BID_BPS, 10, MAX_ACCRUAL);
+        new MidasQuoteHook(POOL_MANAGER, VAULT, MARKET_ADAPTER, maker, t, f, _bounds());
 
         t[1] = MHYPER; // duplicate
         vm.expectRevert(MidasQuoteHook.BadConfig.selector);
-        new MidasQuoteHook(POOL_MANAGER, VAULT, MARKET_ADAPTER, maker, t, f, MAX_BID_BPS, 10, MAX_ACCRUAL);
+        new MidasQuoteHook(POOL_MANAGER, VAULT, MARKET_ADAPTER, maker, t, f, _bounds());
 
         address[] memory four = new address[](4);
         vm.expectRevert(MidasQuoteHook.BadConfig.selector);
-        new MidasQuoteHook(POOL_MANAGER, VAULT, MARKET_ADAPTER, maker, four, four, MAX_BID_BPS, 10, MAX_ACCRUAL);
+        new MidasQuoteHook(POOL_MANAGER, VAULT, MARKET_ADAPTER, maker, four, four, _bounds());
 
         address[] memory two = new address[](2);
         vm.expectRevert(MidasQuoteHook.BadConfig.selector);
-        new MidasQuoteHook(POOL_MANAGER, VAULT, MARKET_ADAPTER, maker, _tokenList(), two, MAX_BID_BPS, 10, MAX_ACCRUAL);
-
-        vm.expectRevert(MidasQuoteHook.BadConfig.selector);
-        new MidasQuoteHook(POOL_MANAGER, VAULT, MARKET_ADAPTER, maker, _tokenList(), _feedList(), 10_001, 10, 1);
+        new MidasQuoteHook(POOL_MANAGER, VAULT, MARKET_ADAPTER, maker, _tokenList(), two, _bounds());
     }
 
-    /// @dev MIN_ASK_PREMIUM_BPS above 10,000 would exceed any uint16-representable premium the maker could need and
-    /// is refused; 10,000 passes the config checks and reaches the hook-address check.
-    function test_constructor_minAskPremiumAboveBps_reverts() public {
-        vm.expectRevert(MidasQuoteHook.BadConfig.selector);
-        new MidasQuoteHook(
-            POOL_MANAGER, VAULT, MARKET_ADAPTER, maker, _tokenList(), _feedList(), MAX_BID_BPS, 10_001, MAX_ACCRUAL
-        );
-        vm.expectRevert(MidasQuoteHook.BadConfig.selector);
-        new MidasQuoteHook(
-            POOL_MANAGER, VAULT, MARKET_ADAPTER, maker, _tokenList(), _feedList(), MAX_BID_BPS, 65_536, MAX_ACCRUAL
-        );
+    /// @dev Every band must be non-empty and within 10,000 bps; a valid set passes the config checks and reaches the
+    /// hook-address check.
+    function test_constructor_badBounds_revert() public {
+        MidasQuoteHook.Bounds[] memory bad = new MidasQuoteHook.Bounds[](9);
+        for (uint256 i; i < bad.length; ++i) {
+            bad[i] = _bounds();
+        }
+        bad[0].maxBidBps = 0;
+        bad[1].maxBidBps = 10_001;
+        bad[2].maxBidDiscountBps = 10_000;
+        bad[3].maxBidDiscountBps = 9; // BPS - maxBidBps = 10 > 9: no discount satisfies both bounds
+        bad[4].minAskPremiumBps = 301; // above maxAskPremiumBps
+        bad[5].maxAskPremiumBps = 10_001;
+        bad[5].minAskPremiumBps = 10_001;
+        bad[6].maxAskApyBps = 10_001;
+        bad[7].minAskPremiumBps = 65_536;
+        bad[8].maxAccrual = 60 days + 1;
+        for (uint256 i; i < bad.length; ++i) {
+            vm.expectRevert(MidasQuoteHook.BadConfig.selector);
+            new MidasQuoteHook(POOL_MANAGER, VAULT, MARKET_ADAPTER, maker, _tokenList(), _feedList(), bad[i]);
+        }
+        MidasQuoteHook.Bounds memory edge = _bounds();
+        edge.maxBidDiscountBps = 10; // exactly BPS - maxBidBps: one discount is valid
+        edge.minAskPremiumBps = 300; // equal to maxAskPremiumBps
+        edge.maxAccrual = 60 days;
         address predicted = vm.computeCreateAddress(address(this), vm.getNonce(address(this)));
         vm.expectRevert(abi.encodeWithSelector(Hooks.HookAddressNotValid.selector, predicted));
-        new MidasQuoteHook(
-            POOL_MANAGER, VAULT, MARKET_ADAPTER, maker, _tokenList(), _feedList(), MAX_BID_BPS, 10_000, MAX_ACCRUAL
-        );
+        new MidasQuoteHook(POOL_MANAGER, VAULT, MARKET_ADAPTER, maker, _tokenList(), _feedList(), edge);
     }
 
     // ------------------------------------------------------------------ fills: mHYPER (currency0)
@@ -557,6 +588,7 @@ contract MidasQuoteHookForkTest is MidasHookForkBase, IUnlockCallback {
             UNIVERSAL_ROUTER,
             X,
             1_392_112_410,
+            0, // no protocol fee on the fork's pools
             1_392_112_410 // idle 0: all deallocated
         );
         vm.expectEmit(true, true, false, true, address(hook));
@@ -569,7 +601,7 @@ contract MidasQuoteHookForkTest is MidasHookForkBase, IUnlockCallback {
         PoolId marbPool = _key(MARB).toId();
         vm.expectEmit(true, false, false, true, address(hook));
         emit MidasQuoteHook.Filled(
-            MARB, MidasQuoteHook.Side.Ask, UNIVERSAL_ROUTER, 1_000e6, 993_481_188_670_372_030_005, 0
+            MARB, MidasQuoteHook.Side.Ask, UNIVERSAL_ROUTER, 1_000e6, 993_481_188_670_372_030_005, 0, 0
         );
         vm.expectEmit(true, true, false, true, address(hook));
         emit MidasQuoteHook.HookSwap(
@@ -1076,20 +1108,276 @@ contract MidasQuoteHookForkTest is MidasHookForkBase, IUnlockCallback {
 
     // ------------------------------------------------------------------ protocol fee
 
-    function test_maxProtocolFee_takesNothing() public {
-        PoolKey memory key = _key(MHYPER);
-        vm.prank(PROTOCOL_FEE_CONTROLLER);
-        pm.setProtocolFee(key, 1000 | (1000 << 12));
-        uint256 feesUsdc = pm.protocolFeesAccrued(Currency.wrap(USDC));
-        uint256 feesMhyper = pm.protocolFeesAccrued(Currency.wrap(MHYPER));
+    // ------------------------------------------------------------------ protocol fee
 
+    /// @dev Distinct per direction so the tests show the hook reads the swap's direction.
+    uint24 constant FEE_ZERO_FOR_ONE = 1_000;
+    uint24 constant FEE_ONE_FOR_ZERO = 400;
+
+    /// @dev Under the governance configuration at the fork block the adapter resolves 0 for these custom-accounting
+    /// pools; anyone can push it, and a fill then pays nothing.
+    function test_protocolFee_governanceDefaultIsZero() public {
+        IV4FeeAdapterLike adapter = IV4FeeAdapterLike(PROTOCOL_FEE_CONTROLLER);
+        assertEq(pm.protocolFeeController(), PROTOCOL_FEE_CONTROLLER);
+        assertEq(adapter.TOKEN_JAR(), TOKEN_JAR);
+        address[] memory toks = _tokenList();
+        for (uint256 i; i < toks.length; ++i) {
+            PoolKey memory key = _key(toks[i]);
+            assertEq(adapter.getFee(key), 0, "policy fee");
+            adapter.triggerFeeUpdate(key);
+            (,, uint24 protocolFee,) = StateLibrary.getSlot0(pm, key.toId());
+            assertEq(protocolFee, 0, "pool protocol fee");
+        }
+        uint256 jarBefore = IERC20Like(USDC).balanceOf(TOKEN_JAR);
         (, uint256 out) = _trade(MHYPER, false, true, X, 0);
         assertEq(out, 1_392_112_410, "bid unchanged");
-        (uint256 paid,) = _trade(MHYPER, true, false, X, type(uint128).max);
-        assertEq(paid, 1_403_473_052, "ask unchanged");
+        assertEq(IERC20Like(USDC).balanceOf(TOKEN_JAR), jarBefore, "nothing to the jar");
+    }
 
-        assertEq(pm.protocolFeesAccrued(Currency.wrap(USDC)), feesUsdc, "USDC protocol fees unchanged");
-        assertEq(pm.protocolFeesAccrued(Currency.wrap(MHYPER)), feesMhyper, "mHYPER protocol fees unchanged");
+    /// @dev Sets the pool's protocol fee the way governance does: the fee setter overrides the pool in the adapter
+    /// and anyone pushes it to the PoolManager.
+    function _setProtocolFee(address token) internal {
+        IV4FeeAdapterLike adapter = IV4FeeAdapterLike(PROTOCOL_FEE_CONTROLLER);
+        PoolKey memory key = _key(token);
+        uint24 fee = FEE_ZERO_FOR_ONE | (FEE_ONE_FOR_ZERO << 12);
+        vm.prank(adapter.feeSetter());
+        adapter.setPoolOverride(key.toId(), fee);
+        adapter.triggerFeeUpdate(key);
+        (,, uint24 protocolFee,) = StateLibrary.getSlot0(pm, key.toId());
+        assertEq(protocolFee, fee, "pool protocol fee set");
+    }
+
+    struct FeeCase {
+        address token;
+        bool buy;
+        bool exactIn;
+        uint256 amount;
+        uint256 paid; // swapper
+        uint256 received; // swapper
+        uint256 fee; // ASSET to the TokenJar
+        uint256 makerAsset; // ASSET the maker paid (bid) or received (ask)
+        uint256 tokenLeg; // tokens bought (bid) or sold (ask)
+    }
+
+    /// @dev Runs one fill with the protocol fee set and checks the swapper's amounts, the TokenJar, the maker's legs
+    /// and that the PoolManager's own protocol fee accounting is untouched.
+    function _feeFill(FeeCase memory c) internal {
+        _setProtocolFee(c.token);
+        uint256 jarBefore = IERC20Like(USDC).balanceOf(TOKEN_JAR);
+        uint256 accruedUsdc = pm.protocolFeesAccrued(Currency.wrap(USDC));
+        uint256 accruedToken = pm.protocolFeesAccrued(Currency.wrap(c.token));
+        (uint128 bidBefore, uint128 askBefore) = _remaining(c.token);
+        uint256 makerTokenBefore = IERC20Like(c.token).balanceOf(maker);
+
+        vm.expectEmit(true, true, false, true, address(hook));
+        emit MidasQuoteHook.ProtocolFeesCollected(TOKEN_JAR, Currency.wrap(USDC), c.fee);
+        vm.expectEmit(true, false, false, true, address(hook));
+        emit MidasQuoteHook.Filled(
+            c.token,
+            c.buy ? MidasQuoteHook.Side.Ask : MidasQuoteHook.Side.Bid,
+            UNIVERSAL_ROUTER,
+            c.paid,
+            c.received,
+            c.fee,
+            c.buy ? 0 : c.makerAsset
+        );
+        vm.recordLogs();
+        (uint256 paid, uint256 received) = _trade(c.token, c.buy, c.exactIn, c.amount, c.exactIn ? c.received : c.paid);
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+
+        assertEq(paid, c.paid, "swapper paid");
+        assertEq(received, c.received, "swapper received");
+        assertEq(IERC20Like(USDC).balanceOf(TOKEN_JAR) - jarBefore, c.fee, "fee to the TokenJar");
+        assertEq(pm.protocolFeesAccrued(Currency.wrap(USDC)), accruedUsdc, "PoolManager USDC fees untouched");
+        assertEq(pm.protocolFeesAccrued(Currency.wrap(c.token)), accruedToken, "PoolManager token fees untouched");
+        (uint128 bidAfter, uint128 askAfter) = _remaining(c.token);
+        if (c.buy) {
+            assertEq(askAfter, askBefore - c.tokenLeg, "askRemaining -= tokens sold");
+            assertEq(makerTokenBefore - IERC20Like(c.token).balanceOf(maker), c.tokenLeg, "maker delivered");
+            assertEq(_claim(USDC), c.makerAsset, "maker's USDC claim = USDC in - fee");
+        } else {
+            assertEq(bidAfter, bidBefore - c.tokenLeg, "bidRemaining -= tokens bought");
+            assertEq(_claim(c.token), c.tokenLeg, "token claim = tokens bought");
+            // Vault idle is 0 and there are no USDC claims, so the maker's whole ASSET leg is deallocated.
+            assertEq(_filledDeallocated(logs), c.makerAsset, "maker paid USDC out + fee");
+        }
+        _assertHookHoldsNoErc20();
+    }
+
+    // Expected amounts: Python fractions from the formulas in _consume. mHYPER is currency0, so its bid is
+    // zeroForOne (1,000 pips) and its ask oneForZero (400); mArb is currency1, the other way round.
+
+    function test_protocolFee_mHYPER_bidExactIn() public {
+        _feeFill(FeeCase(MHYPER, false, true, X, X, 1_390_720_297, 1_392_113, 1_392_112_410, X));
+    }
+
+    function test_protocolFee_mHYPER_bidExactOut() public {
+        _feeFill(
+            FeeCase(
+                MHYPER,
+                false,
+                false,
+                1_000e6,
+                887_718_323_336_394_563_943,
+                1_000e6,
+                1_001_002,
+                1_001_001_002,
+                887_718_323_336_394_563_943
+            )
+        );
+    }
+
+    function test_protocolFee_mHYPER_askExactIn() public {
+        _feeFill(
+            FeeCase(
+                MHYPER,
+                true,
+                true,
+                1_000e6,
+                1_000e6,
+                879_300_148_802_324_866_100,
+                400_000,
+                999_600_000,
+                879_300_148_802_324_866_100
+            )
+        );
+    }
+
+    function test_protocolFee_mHYPER_askExactOut() public {
+        _feeFill(FeeCase(MHYPER, true, false, X, 1_404_034_666, X, 561_614, 1_403_473_052, X));
+    }
+
+    function test_protocolFee_mArb_bidExactIn() public {
+        _feeFill(FeeCase(MARB, false, true, X, X, 1_227_903_691, 491_359, 1_228_395_050, X));
+    }
+
+    function test_protocolFee_mArb_bidExactOut() public {
+        _feeFill(
+            FeeCase(
+                MARB,
+                false,
+                false,
+                1_000e6,
+                1_005_427_297_487_437_185_930,
+                1_000e6,
+                400_161,
+                1_000_400_161,
+                1_005_427_297_487_437_185_930
+            )
+        );
+    }
+
+    function test_protocolFee_mArb_askExactIn() public {
+        _feeFill(
+            FeeCase(
+                MARB,
+                true,
+                true,
+                1_000e6,
+                1_000e6,
+                992_487_707_481_701_657_975,
+                1_000_000,
+                999_000_000,
+                992_487_707_481_701_657_975
+            )
+        );
+    }
+
+    function test_protocolFee_mArb_askExactOut() public {
+        _feeFill(FeeCase(MARB, true, false, X, 1_243_912_526, X, 1_243_913, 1_242_668_613, X));
+    }
+
+    /// @dev The quoter runs the same beforeSwap, so quotes include the fee.
+    function test_protocolFee_quoterMatchesSwap() public {
+        _setProtocolFee(MHYPER);
+        _setProtocolFee(MARB);
+        (uint256 quotedBid,) = IV4Quoter(V4_QUOTER)
+            .quoteExactInputSingle(
+                QuoteExactSingleParams({
+                    poolKey: _key(MHYPER), zeroForOne: _zeroForOne(MHYPER, false), exactAmount: uint128(X), hookData: ""
+                })
+            );
+        (uint256 quotedAsk,) = IV4Quoter(V4_QUOTER)
+            .quoteExactInputSingle(
+                QuoteExactSingleParams({
+                    poolKey: _key(MARB), zeroForOne: _zeroForOne(MARB, true), exactAmount: 1_000e6, hookData: ""
+                })
+            );
+        (, uint256 bidOut) = _trade(MHYPER, false, true, X, 0);
+        (, uint256 askOut) = _trade(MARB, true, true, 1_000e6, 0);
+        assertEq(quotedBid, bidOut, "bid quote = swap");
+        assertEq(quotedAsk, askOut, "ask quote = swap");
+        assertEq(quotedBid, 1_390_720_297);
+        assertEq(quotedAsk, 992_487_707_481_701_657_975);
+    }
+
+    /// @dev With no resolvable TokenJar nothing is charged, as in Uniswap's aggregator hooks: the controller reverts,
+    /// names address 0, answers a word that is not an address, or never returns.
+    function test_protocolFee_noTokenJar_chargesNothing() public {
+        _setProtocolFee(MHYPER);
+        uint256 jarBefore = IERC20Like(USDC).balanceOf(TOKEN_JAR);
+        vm.mockCallRevert(PROTOCOL_FEE_CONTROLLER, abi.encodeCall(IV4FeeAdapterLike.TOKEN_JAR, ()), "");
+        (, uint256 out) = _trade(MHYPER, false, true, X, 0);
+        assertEq(out, 1_392_112_410, "controller reverts: no fee");
+        vm.clearMockedCalls();
+        vm.mockCall(PROTOCOL_FEE_CONTROLLER, abi.encodeCall(IV4FeeAdapterLike.TOKEN_JAR, ()), abi.encode(address(0)));
+        (, out) = _trade(MHYPER, false, true, X, 0);
+        assertEq(out, 1_392_112_410, "jar is address 0: no fee");
+        vm.mockCall(
+            PROTOCOL_FEE_CONTROLLER, abi.encodeCall(IV4FeeAdapterLike.TOKEN_JAR, ()), abi.encode(type(uint256).max)
+        );
+        (, out) = _trade(MHYPER, false, true, X, 0);
+        assertEq(out, 1_392_112_410, "not an address: no fee");
+        vm.clearMockedCalls();
+        // At a realistic gas limit: an uncapped lookup would burn 63/64 of it and starve the rest of the swap.
+        vm.etch(PROTOCOL_FEE_CONTROLLER, address(new GasBurningController()).code);
+        swapGas = 3_000_000;
+        (, out) = _trade(MHYPER, false, true, X, 0);
+        assertEq(out, 1_392_112_410, "controller never returns: no fee");
+        assertEq(IERC20Like(USDC).balanceOf(TOKEN_JAR), jarBefore, "nothing to the jar");
+    }
+
+    /// @dev A fee that would take the whole output reverts instead of filling for nothing.
+    function test_protocolFee_dustOutputReverts() public {
+        _setProtocolFee(MHYPER);
+        // The smallest exact-in the bid prices at 1 USDC base unit; the fee, ceil(1 x 1,000 / 1e6) = 1, takes it all.
+        uint256 oneUnitIn = 886_830_604_129; // ceil(1e12 / (1.13327745 x 0.995))
+        _expectSwapRevert(abi.encodeWithSelector(MidasQuoteHook.ZeroAmount.selector));
+        _swap(MHYPER, false, true, oneUnitIn, 0);
+    }
+
+    // ------------------------------------------------------------------ swapper bands
+
+    function test_setParams_swapperBands() public {
+        MidasQuoteHook.Params memory p = _params(126);
+        vm.startPrank(maker);
+        p.bidDiscountBps = 301;
+        vm.expectRevert(MidasQuoteHook.DiscountAboveMax.selector);
+        hook.setParams(MHYPER, p);
+        p.bidDiscountBps = 300;
+        p.askPremiumBps = 301;
+        vm.expectRevert(MidasQuoteHook.PremiumAboveMax.selector);
+        hook.setParams(MHYPER, p);
+        p.askPremiumBps = 300;
+        p.askApyBps = 2_001;
+        vm.expectRevert(MidasQuoteHook.ApyAboveMax.selector);
+        hook.setParams(MHYPER, p);
+        p.askApyBps = 2_000;
+        hook.setParams(MHYPER, p); // every swapper bound exactly
+        // A closed side is not checked.
+        p.bidRemaining = 0;
+        p.bidDiscountBps = 9_999;
+        hook.setParams(MHYPER, p);
+        p.bidRemaining = REMAINING;
+        p.bidDiscountBps = 300;
+        p.askRemaining = 0;
+        p.askPremiumBps = type(uint16).max;
+        p.askApyBps = type(uint16).max;
+        hook.setParams(MHYPER, p);
+        vm.stopPrank();
+
+        (, uint256 usdcOut) = _trade(MHYPER, false, true, 1_000e18, 0);
+        assertEq(usdcOut, 1_099_279_126, "floor(1000 x 1.13327745 x 0.97)");
     }
 
     // ------------------------------------------------------------------ liquidity
